@@ -1,0 +1,17 @@
+# gitignore
+
+# Environment Variables
+.env
+*.env
+.env.*
+*.env.*
+
+#### Certificates #####
+.cert
+.cer
+.der
+.pem
+
+##### System Files #####
+.ini
+.DS_Store
