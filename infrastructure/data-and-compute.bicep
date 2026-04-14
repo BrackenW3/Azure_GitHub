@@ -27,8 +27,11 @@ param adminUsername string = 'willbrackenadmin'
 @description('VM size — override if Standard_B1s is not available in your region. Checked sizes: Standard_B1s, Standard_B1ms, Standard_B2s, Standard_A1_v2')
 param vmSize string = 'Standard_B1s'
 
-@description('Location for Azure SQL Server — defaults to eastus. East US 2 frequently rejects new SQL server creation.')
-param sqlLocation string = 'eastus'
+@description('Location for Azure SQL Server AND PostgreSQL — defaults to centralus. East US/East US 2 frequently reject new server creation. Tested working: centralus, westus3.')
+param sqlLocation string = 'centralus'
+
+@description('Optional suffix override for resource names — use when ARM has a ghost reservation on the auto-generated name. Default: first 6 chars of uniqueString(resourceGroup().id).')
+param nameSuffix string = take(uniqueString(resourceGroup().id), 6)
 
 @secure()
 param adminPassword string
@@ -39,10 +42,7 @@ param allowedClientIp string
 @description('Object ID of the Entra user to set as SQL + PostgreSQL admin. Run: az ad signed-in-user show --query id -o tsv')
 param adminEntraObjectId string = 'b4cf1f2a-1f1c-455b-964f-b0dc8dcd9d81'
 
-@description('Display name of the Entra admin user')
-param adminEntraDisplayName string = 'Will Bracken'
-
-@description('UPN or email of the Entra admin — for SQL Server must be the guest UPN in this tenant')
+@description('UPN or email of the Entra admin — for SQL Server must be the guest UPN in this tenant. PostgreSQL Entra admin is set post-deploy.')
 param adminEntraLogin string = 'william.i.bracken_outlook.com#EXT#@willbracken.com'
 
 var tags = {
@@ -150,8 +150,8 @@ resource freeVM 'Microsoft.Compute/virtualMachines@2023-03-01' = {
 // Burstable B1ms — free for 12 months. PostgreSQL 16 (LTS).
 // Firewall: restricted to Azure services + your IP only.
 resource postgresServer 'Microsoft.DBforPostgreSQL/flexibleServers@2023-06-01-preview' = {
-  name: 'willbracken-pg-${take(uniqueString(resourceGroup().id), 6)}'
-  location: location
+  name: 'willbracken-pg-${nameSuffix}'
+  location: sqlLocation    // centralus — eastus2 quota restricted for PostgreSQL
   tags: tags
   sku: {
     name: 'Standard_B1ms'
@@ -180,16 +180,14 @@ resource postgresServer 'Microsoft.DBforPostgreSQL/flexibleServers@2023-06-01-pr
 }
 
 // ── PostgreSQL Entra Admin ─────────────────────────────────────────────────────
-// Assigns the signed-in Microsoft account as the Entra admin for PostgreSQL.
-resource pgEntraAdmin 'Microsoft.DBforPostgreSQL/flexibleServers/administrators@2023-06-01-preview' = {
-  parent: postgresServer
-  name: adminEntraObjectId
-  properties: {
-    principalType: 'User'
-    principalName: adminEntraDisplayName
-    tenantId: subscription().tenantId
-  }
-}
+// NOTE: Moved out of Bicep — Azure requires a delay after server creation before
+// AAD auth operations are available. Set manually after deployment:
+//
+//   az postgres flexible-server ad-admin create \
+//     -g willbracken-free-rg -s <server-name> \
+//     --display-name "Will Bracken" \
+//     --object-id b4cf1f2a-1f1c-455b-964f-b0dc8dcd9d81 \
+//     --tenant-id $(az account show --query tenantId -o tsv)
 
 // Allow Azure services to reach PostgreSQL (e.g. App Services, Functions, Container Apps)
 resource pgFirewallAzureServices 'Microsoft.DBforPostgreSQL/flexibleServers/firewallRules@2023-06-01-preview' = {
@@ -215,7 +213,7 @@ resource pgFirewallClientIp 'Microsoft.DBforPostgreSQL/flexibleServers/firewallR
 // Microsoft Entra admin: enables AAD login — no SQL password needed for app accounts.
 // Password auth kept for emergency DBA access.
 resource sqlServer 'Microsoft.Sql/servers@2023-05-01-preview' = {
-  name: 'willbracken-sql-${take(uniqueString(resourceGroup().id), 6)}'
+  name: 'willbracken-sql-${nameSuffix}'
   location: sqlLocation    // eastus by default — East US 2 rejects new SQL server creation
   tags: tags
   identity: {
