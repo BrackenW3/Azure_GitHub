@@ -183,7 +183,7 @@ resource pgEntraAdmin 'Microsoft.DBforPostgreSQL/flexibleServers/administrators@
   name: adminEntraObjectId
   properties: {
     principalType: 'User'
-    principalName: adminEntraLogin
+    principalName: adminEntraDisplayName
     tenantId: subscription().tenantId
   }
 }
