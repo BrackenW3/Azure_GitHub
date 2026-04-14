@@ -27,6 +27,9 @@ param adminUsername string = 'willbrackenadmin'
 @description('VM size — override if Standard_B1s is not available in your region. Checked sizes: Standard_B1s, Standard_B1ms, Standard_B2s, Standard_A1_v2')
 param vmSize string = 'Standard_B1s'
 
+@description('Location for Azure SQL Server — defaults to eastus. East US 2 frequently rejects new SQL server creation.')
+param sqlLocation string = 'eastus'
+
 @secure()
 param adminPassword string
 
@@ -73,9 +76,9 @@ resource publicIP 'Microsoft.Network/publicIPAddresses@2023-04-01' = {
   name: 'willbracken-vm-pip'
   location: location
   tags: tags
-  sku: { name: 'Basic' }
+  sku: { name: 'Standard' }
   properties: {
-    publicIPAllocationMethod: 'Dynamic'
+    publicIPAllocationMethod: 'Static'
   }
 }
 
@@ -213,7 +216,7 @@ resource pgFirewallClientIp 'Microsoft.DBforPostgreSQL/flexibleServers/firewallR
 // Password auth kept for emergency DBA access.
 resource sqlServer 'Microsoft.Sql/servers@2023-05-01-preview' = {
   name: 'willbracken-sql-${take(uniqueString(resourceGroup().id), 6)}'
-  location: location
+  location: sqlLocation    // eastus by default — East US 2 rejects new SQL server creation
   tags: tags
   identity: {
     type: 'SystemAssigned'    // Required for Entra-only auth (Microsoft recommendation)
@@ -243,7 +246,7 @@ resource sqlEntraAdmin 'Microsoft.Sql/servers/administrators@2023-05-01-preview'
 resource sqlDatabase 'Microsoft.Sql/servers/databases@2023-05-01-preview' = {
   parent: sqlServer
   name: 'willbracken-db'
-  location: location
+  location: sqlLocation
   tags: tags
   sku: {
     name: 'GP_S_Gen5_1'
