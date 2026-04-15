@@ -4,9 +4,9 @@
 //
 // Deploys:
 //   • Azure OpenAI account (kind: OpenAI, sku: S0, API version 2023-10-01-preview)
-//   • gpt-4o deployment              (capacity: 10 TPM, sku: Standard)
-//   • gpt-4o-mini deployment         (capacity: 20 TPM, sku: Standard)
-//   • text-embedding-3-small         (capacity: 50 TPM, sku: Standard)
+//   • gpt-4o deployment              (capacity: 10 TPM, sku: GlobalStandard — quota 450K avail)
+//   • gpt-4o-mini deployment         (capacity: 20 TPM, sku: GlobalStandard — quota 2M avail)
+//   • text-embedding-3-small         (capacity: 50 TPM, sku: GlobalStandard — quota 1M avail)
 //   • Outputs: endpoint, accountName, resourceId
 //
 // ⚠️  REVIEW BEFORE DEPLOY — Azure OpenAI S0 has no free-tier billing cap.
@@ -84,7 +84,7 @@ resource gpt4oDeployment 'Microsoft.CognitiveServices/accounts/deployments@2023-
   parent: openAIAccount
   name: 'gpt-4o'
   sku: {
-    name: 'Standard'
+    name: 'GlobalStandard'
     capacity: gpt4oCapacity
   }
   properties: {
@@ -105,7 +105,7 @@ resource gpt4oMiniDeployment 'Microsoft.CognitiveServices/accounts/deployments@2
   name: 'gpt-4o-mini'
   dependsOn: [gpt4oDeployment]    // Serial deployment required within the same account
   sku: {
-    name: 'Standard'
+    name: 'GlobalStandard'
     capacity: gpt4oMiniCapacity
   }
   properties: {
@@ -126,7 +126,7 @@ resource embeddingDeployment 'Microsoft.CognitiveServices/accounts/deployments@2
   name: 'text-embedding-3-small'
   dependsOn: [gpt4oMiniDeployment]    // Serial deployment required within the same account
   sku: {
-    name: 'Standard'
+    name: 'GlobalStandard'
     capacity: embeddingCapacity
   }
   properties: {
