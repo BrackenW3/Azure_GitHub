@@ -1,0 +1,25 @@
+{
+  "name": "ai-router",
+  "version": "1.0.0",
+  "description": "Azure AI Router — routes requests to the optimal AI provider based on task type",
+  "main": "server.js",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "@azure/app-configuration": "^1.7.0",
+    "@azure/identity": "^4.5.0",
+    "@azure/monitor-opentelemetry": "^1.9.0",
+    "@opentelemetry/api": "^1.9.0",
+    "express": "^4.21.2",
+    "node-fetch": "^3.3.2"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0"
+  }
+}
