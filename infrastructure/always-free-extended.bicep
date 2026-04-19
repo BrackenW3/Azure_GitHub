@@ -5,6 +5,8 @@
 // Deploy alongside always-free.bicep (Cosmos DB + Functions already there).
 //
 // Provisions:
+//   • User-assigned Managed Identity (shared auth identity for all services)
+//   • RBAC role assignments (Key Vault Secrets User, App Config Reader, SB Data Receiver)
 //   • Key Vault (secrets management — 10K ops/month free)
 //   • Container Apps Environment + placeholder app (180K vCPU-s/month free)
 //   • Static Web Apps (free tier — unlimited sites, 100GB/month)
@@ -16,7 +18,7 @@
 //
 // Deploy:
 //   az deployment group create \
-//     --resource-group willbracken-rg \
+//     --resource-group willbracken-free-rg \
 //     --template-file always-free-extended.bicep
 // =============================================================================
 
@@ -28,12 +30,34 @@ param location string = resourceGroup().location
 param baseName string = 'willbracken'
 
 @description('Publisher email for API Management (required)')
-param apimPublisherEmail string = 'will@willbracken.com'
+param apimPublisherEmail string = 'william.i.bracken@outlook.com'
 
 @description('Publisher name for API Management')
 param apimPublisherName string = 'Will Bracken'
 
+@description('Location for Static Web Apps — limited region support, must be eastus2/westus2/centralus/westeurope/eastasia')
+param staticWebAppLocation string = 'eastus2'
+
 var uniqueSuffix = take(uniqueString(resourceGroup().id), 6)
+
+// ── Built-in RBAC role definition IDs ────────────────────────────────────────
+var roleKeyVaultSecretsUser     = '4633458b-17de-408a-b874-0445c86b69e6'
+var roleAppConfigDataReader     = '516239f1-63e1-4d78-a4de-a74fb236a071'
+var roleServiceBusDataReceiver  = '4f6d3b9b-027b-4f4c-9142-0e5a2a2247e0'
+var roleServiceBusDataSender    = '69a216fc-b8fb-44d8-bc22-1f3c2cd27a39'
+
+// ── Platform Managed Identity (reference — created by managed-identities.bicep) ──
+// Do not recreate here. managed-identities.bicep is the authoritative source.
+// Deploy managed-identities.bicep first, then pass its output as platformIdentityId.
+param platformIdentityId string = ''
+
+var resolvedIdentityName = !empty(platformIdentityId)
+  ? last(split(platformIdentityId, '/'))
+  : '${baseName}-platform-id'
+
+resource managedIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' existing = {
+  name: resolvedIdentityName
+}
 
 // ── Key Vault ─────────────────────────────────────────────────────────────────
 // Secrets manager: store all API keys, connection strings, SP credentials here.
@@ -45,13 +69,13 @@ resource keyVault 'Microsoft.KeyVault/vaults@2023-07-01' = {
   properties: {
     sku: {
       family: 'A'
-      name: 'standard'       // Standard is free within 10K ops/month
+      name: 'standard'
     }
     tenantId: subscription().tenantId
-    enableRbacAuthorization: true    // Use RBAC instead of access policies (modern pattern)
-    enableSoftDelete: true           // 90-day recovery window (on by default)
+    enableRbacAuthorization: true    // RBAC — managed identity is granted access below
+    enableSoftDelete: true
     softDeleteRetentionInDays: 90
-    publicNetworkAccess: 'Enabled'   // Required for MCP + n8n access without VNet
+    publicNetworkAccess: 'Enabled'
     networkAcls: {
       bypass: 'AzureServices'
       defaultAction: 'Allow'
@@ -59,10 +83,19 @@ resource keyVault 'Microsoft.KeyVault/vaults@2023-07-01' = {
   }
 }
 
-// ── Container Apps Environment ────────────────────────────────────────────────
-// Serverless container hosting. No VM quota needed. Scale to zero = free.
-// Free: 180K vCPU-seconds + 360K GiB-seconds per subscription per month.
-// This environment hosts any Docker container without managing Kubernetes.
+// Grant managed identity read access to Key Vault secrets.
+// Eliminates the need for connection-string-based secret retrieval.
+resource kvSecretsUserAssignment 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(keyVault.id, managedIdentity.id, roleKeyVaultSecretsUser)
+  scope: keyVault
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', roleKeyVaultSecretsUser)
+    principalId: managedIdentity.properties.principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+
+// ── Log Analytics Workspace ───────────────────────────────────────────────────
 resource logAnalyticsWorkspace 'Microsoft.OperationalInsights/workspaces@2022-10-01' = {
   name: '${baseName}-logs-${uniqueSuffix}'
   location: location
@@ -70,14 +103,17 @@ resource logAnalyticsWorkspace 'Microsoft.OperationalInsights/workspaces@2022-10
     sku: {
       name: 'PerGB2018'
     }
-    retentionInDays: 30    // Minimum retention — 5GB/month free
+    retentionInDays: 30
     features: {
       enableLogAccessUsingOnlyResourcePermissions: true
     }
   }
 }
 
-resource containerAppsEnv 'Microsoft.App/managedEnvironments@2023-11-02-preview' = {
+// ── Container Apps Environment ────────────────────────────────────────────────
+// Serverless container hosting. No VM quota needed. Scale to zero = free.
+// Free: 180K vCPU-seconds + 360K GiB-seconds per subscription per month.
+resource containerAppsEnv 'Microsoft.App/managedEnvironments@2023-05-01' = {
   name: '${baseName}-cae'
   location: location
   properties: {
@@ -88,24 +124,23 @@ resource containerAppsEnv 'Microsoft.App/managedEnvironments@2023-11-02-preview'
         sharedKey: logAnalyticsWorkspace.listKeys().primarySharedKey
       }
     }
-    workloadProfiles: [
-      {
-        name: 'Consumption'
-        workloadProfileType: 'Consumption'  // Always-free consumption profile
-      }
-    ]
   }
 }
 
-// Placeholder Container App — replace image with your actual workloads.
-// Example use cases: email classifier worker, Neo4j sync job, webhook handler.
-// Scale to 0 replicas when not in use = $0 cost.
-resource placeholderApp 'Microsoft.App/containerApps@2023-11-02-preview' = {
+// Container App — uses managed identity so it can pull secrets from Key Vault
+// without any hardcoded credentials.  Replace the placeholder image with your
+// actual workload image.  Scale to 0 replicas = $0 when idle.
+resource placeholderApp 'Microsoft.App/containerApps@2023-05-01' = {
   name: '${baseName}-app'
   location: location
+  identity: {
+    type: 'UserAssigned'
+    userAssignedIdentities: {
+      '${managedIdentity.id}': {}
+    }
+  }
   properties: {
     managedEnvironmentId: containerAppsEnv.id
-    workloadProfileName: 'Consumption'
     configuration: {
       ingress: {
         external: true
@@ -120,13 +155,20 @@ resource placeholderApp 'Microsoft.App/containerApps@2023-11-02-preview' = {
           name: 'placeholder'
           image: 'mcr.microsoft.com/azuredocs/containerapps-helloworld:latest'
           resources: {
-            cpu: json('0.25')    // Quarter vCPU — cheapest option
+            cpu: json('0.25')
             memory: '0.5Gi'
           }
+          env: [
+            {
+              // App reads its own managed identity client ID at runtime
+              name: 'AZURE_CLIENT_ID'
+              value: managedIdentity.properties.clientId
+            }
+          ]
         }
       ]
       scale: {
-        minReplicas: 0           // Scale to zero = $0 when idle
+        minReplicas: 0
         maxReplicas: 3
         rules: [
           {
@@ -146,11 +188,9 @@ resource placeholderApp 'Microsoft.App/containerApps@2023-11-02-preview' = {
 // ── Static Web Apps (Free tier) ───────────────────────────────────────────────
 // Host any static frontend (React, Vue, Next.js, plain HTML).
 // Free: unlimited sites, 100GB bandwidth/month, 500 deploys/month.
-// Auto-deploys from GitHub via GitHub Actions. Custom domains supported.
-// Perfect for: Platform Home frontend, family task submission form.
 resource staticWebApp 'Microsoft.Web/staticSites@2023-01-01' = {
   name: '${baseName}-web'
-  location: location   // Static Web Apps have limited region availability — eastus2, westus2, centralus, etc.
+  location: staticWebAppLocation
   sku: {
     name: 'Free'
     tier: 'Free'
@@ -159,21 +199,26 @@ resource staticWebApp 'Microsoft.Web/staticSites@2023-01-01' = {
     stagingEnvironmentPolicy: 'Enabled'
     allowConfigFileUpdates: true
     buildProperties: {
-      skipGithubActionWorkflowGeneration: true   // We'll manage GitHub Actions ourselves
+      skipGithubActionWorkflowGeneration: true
     }
   }
 }
 
 // ── API Management (Consumption tier) ────────────────────────────────────────
 // API gateway for all services. 1M calls/month free on Consumption tier.
-// Route external requests → n8n webhooks / CF Workers / Azure Functions.
 // Note: Consumption tier takes ~5 minutes to provision (normal).
-resource apim 'Microsoft.ApiManagement/service@2023-05-01-preview' = {
+resource apim 'Microsoft.ApiManagement/service@2022-08-01' = {
   name: '${baseName}-apim-${uniqueSuffix}'
   location: location
   sku: {
-    name: 'Consumption'   // Always free for first 1M calls/month
-    capacity: 0           // 0 = Consumption mode (no dedicated capacity)
+    name: 'Consumption'
+    capacity: 0
+  }
+  identity: {
+    type: 'UserAssigned'
+    userAssignedIdentities: {
+      '${managedIdentity.id}': {}
+    }
   }
   properties: {
     publisherEmail: apimPublisherEmail
@@ -191,22 +236,21 @@ resource apim 'Microsoft.ApiManagement/service@2023-05-01-preview' = {
 // Use for: new email arrived → trigger Functions → trigger n8n webhook.
 resource eventGridTopic 'Microsoft.EventGrid/systemTopics@2023-12-15-preview' = {
   name: '${baseName}-events'
-  location: location
+  location: 'global'    // ResourceGroups topic type requires 'global' — not the RG location
   properties: {
     source: resourceGroup().id
-    topicType: 'Microsoft.Resources.ResourceGroups'   // Fires on resource group events
+    topicType: 'Microsoft.Resources.ResourceGroups'
   }
 }
 
 // ── Service Bus (Basic tier) ──────────────────────────────────────────────────
 // Message queuing. Free: 10M messages/month on Basic tier.
-// Use for: async email processing queue, retry logic, n8n ↔ Functions decoupling.
-// Note: Basic tier does NOT support Topics (only queues). Use Standard for Topics.
+// Note: Basic tier does NOT support Topics (only queues). Upgrade to Standard for Topics.
 resource serviceBusNamespace 'Microsoft.ServiceBus/namespaces@2022-10-01-preview' = {
   name: '${baseName}-bus-${uniqueSuffix}'
   location: location
   sku: {
-    name: 'Basic'     // 10M messages/month free
+    name: 'Basic'
     tier: 'Basic'
     capacity: 1
   }
@@ -221,46 +265,48 @@ resource emailQueue 'Microsoft.ServiceBus/namespaces/queues@2022-10-01-preview' 
   parent: serviceBusNamespace
   name: 'email-processing'
   properties: {
-    maxSizeInMegabytes: 1024      // 1GB queue size
-    defaultMessageTimeToLive: 'P7D'  // 7-day TTL
-    lockDuration: 'PT5M'          // 5-minute processing lock
-    maxDeliveryCount: 3           // Retry 3 times before dead-lettering
+    maxSizeInMegabytes: 1024
+    defaultMessageTimeToLive: 'P7D'
+    lockDuration: 'PT5M'
+    maxDeliveryCount: 3
     deadLetteringOnMessageExpiration: true
   }
 }
 
-// ── AI Search (Free F0 tier) ──────────────────────────────────────────────────
-// Cognitive search for structured data. Free F0: 3 indexes, 50MB, 3 indexers.
-// Enough for email metadata search + Jira ticket search (2 indexes).
-// Compare quality vs Cloudflare Vectorize — keep winner, drop loser.
-// If F0 wins the quality test: upgrade to S1 only if needed (~$73/month).
-resource aiSearch 'Microsoft.Search/searchServices@2023-11-01' = {
-  name: '${baseName}-search-${uniqueSuffix}'
-  location: location
-  sku: {
-    name: 'free'     // F0 — always free, no expiry. 3 indexes, 50MB.
-  }
+// Grant managed identity send + receive on Service Bus.
+// n8n and Container App workers authenticate via identity — no SAS keys needed.
+resource sbReceiverAssignment 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(serviceBusNamespace.id, managedIdentity.id, roleServiceBusDataReceiver)
+  scope: serviceBusNamespace
   properties: {
-    replicaCount: 1
-    partitionCount: 1
-    hostingMode: 'default'
-    publicNetworkAccess: 'enabled'
-    authOptions: {
-      aadOrApiKey: {
-        aadAuthFailureMode: 'http401WithBearerChallenge'
-      }
-    }
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', roleServiceBusDataReceiver)
+    principalId: managedIdentity.properties.principalId
+    principalType: 'ServicePrincipal'
   }
 }
 
+resource sbSenderAssignment 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(serviceBusNamespace.id, managedIdentity.id, roleServiceBusDataSender)
+  scope: serviceBusNamespace
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', roleServiceBusDataSender)
+    principalId: managedIdentity.properties.principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+
+// ── AI Search ─────────────────────────────────────────────────────────────────
+// SKIPPED: Free tier (F0) is limited to 1 per subscription and one already exists.
+// Find existing service: portal → Search services → willbracken-search-*
+
 // ── App Configuration ─────────────────────────────────────────────────────────
 // Feature flags and app settings — centralized config store.
-// Free: 10M requests/month. Store n8n webhook URLs, feature toggles, env-specific settings.
+// Free: 10M requests/month. Store n8n webhook URLs, feature toggles, env settings.
 resource appConfig 'Microsoft.AppConfiguration/configurationStores@2023-03-01' = {
   name: '${baseName}-config-${uniqueSuffix}'
   location: location
   sku: {
-    name: 'free'   // 10M requests/month, 1MB storage — always free
+    name: 'free'
   }
   properties: {
     disableLocalAuth: false
@@ -268,14 +314,40 @@ resource appConfig 'Microsoft.AppConfiguration/configurationStores@2023-03-01' =
   }
 }
 
+// Grant managed identity read access to App Configuration.
+resource appConfigReaderAssignment 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(appConfig.id, managedIdentity.id, roleAppConfigDataReader)
+  scope: appConfig
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', roleAppConfigDataReader)
+    principalId: managedIdentity.properties.principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+
+// ── Store Service Bus connection string in Key Vault ──────────────────────────
+// Workloads that still need a connection string (e.g. older clients) can read
+// it from Key Vault using the managed identity — no secret in code or config.
+resource sbConnectionStringSecret 'Microsoft.KeyVault/vaults/secrets@2023-07-01' = {
+  parent: keyVault
+  name: 'servicebus-connection-string'
+  properties: {
+    value: listKeys('${serviceBusNamespace.id}/AuthorizationRules/RootManageSharedAccessKey', '2021-11-01').primaryConnectionString
+  }
+}
+
 // ── Outputs ───────────────────────────────────────────────────────────────────
+output managedIdentityClientId string = managedIdentity.properties.clientId
+output managedIdentityResourceId string = managedIdentity.id
 output keyVaultUri string = keyVault.properties.vaultUri
 output keyVaultName string = keyVault.name
 output containerAppsEnvId string = containerAppsEnv.id
-output containerAppUrl string = 'https://${placeholderApp.properties.configuration.ingress.fqdn}'
+output containerAppUrl string = placeholderApp.properties.configuration.ingress != null
+  ? 'https://${placeholderApp.properties.configuration.ingress.fqdn}'
+  : 'ingress not yet assigned — check portal'
 output staticWebAppUrl string = 'https://${staticWebApp.properties.defaultHostname}'
-output apimGatewayUrl string = 'https://${apim.properties.gatewayUrl}'
-output serviceBusConnectionString string = listKeys('${serviceBusNamespace.id}/AuthorizationRules/RootManageSharedAccessKey', serviceBusNamespace.apiVersion).primaryConnectionString
-output aiSearchEndpoint string = 'https://${aiSearch.name}.search.windows.net'
+output apimGatewayUrl string = apim.properties.gatewayUrl
+output serviceBusNamespace string = serviceBusNamespace.name
+output serviceBusConnectionStringSecretUri string = sbConnectionStringSecret.properties.secretUri
 output appConfigEndpoint string = appConfig.properties.endpoint
 output logAnalyticsWorkspaceId string = logAnalyticsWorkspace.properties.customerId

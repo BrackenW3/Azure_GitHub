@@ -1,0 +1,290 @@
+<!--
+  apim-ai-gateway.xml — Azure API Management unified AI gateway policy
+  Resource group: willbracken-free-rg
+  APIM instance:  willbracken-apim-ihe42a
+
+  Apply at the API level for each AI backend, or at the product/global level
+  for shared concerns (rate limiting, JWT validation, cost logging).
+
+  Named values referenced (set in APIM → Named values, sourced from KV):
+    anthropic-api-key  → {{anthropic-api-key}}  (KV ref: willbracken-kv-ihe42a/anthropic)
+    openai-api-key     → {{openai-api-key}}      (KV ref: willbracken-kv-ihe42a/openai)
+    gemini-api-key     → {{gemini-api-key}}      (KV ref: willbracken-kv-ihe42a/gemini)
+    mistral-api-key    → {{mistral-api-key}}      (KV ref: willbracken-kv-ihe42a/mistral)
+    jwt-signing-key    → {{jwt-signing-key}}
+
+  Backends (configure in APIM → Backends):
+    anthropic-backend  https://api.anthropic.com
+    openai-backend     https://api.openai.com
+    gemini-backend     https://generativelanguage.googleapis.com
+    mistral-backend    https://api.mistral.ai
+
+  Routes exposed through APIM:
+    POST /api/ai/claude   → Anthropic /v1/messages
+    POST /api/ai/openai   → OpenAI    /v1/chat/completions
+    POST /api/ai/gemini   → Gemini    /v1beta/models/{model}:generateContent
+    POST /api/ai/mistral  → Mistral   /v1/chat/completions
+-->
+
+<!-- ═══════════════════════════════════════════════════════════════════
+     GLOBAL / PRODUCT POLICY  — paste into the <inbound> section of the
+     product or API that groups all /api/ai/* operations.
+     ═══════════════════════════════════════════════════════════════════ -->
+<policies>
+  <inbound>
+    <!-- ── 1. JWT Validation ──────────────────────────────────────────
+         Validates a Bearer JWT signed with HS256 using the shared key.
+         Replace openid-config URL or switch to validate-jwt with
+         openid-config when using Azure AD / Entra ID tokens.
+    ──────────────────────────────────────────────────────────────────-->
+    <validate-jwt header-name="Authorization" failed-validation-httpcode="401"
+                  failed-validation-error-message="Unauthorized — valid JWT required">
+      <issuer-signing-keys>
+        <key>{{jwt-signing-key}}</key>
+      </issuer-signing-keys>
+      <audiences>
+        <audience>willbracken-ai-gateway</audience>
+      </audiences>
+      <issuers>
+        <issuer>https://willbracken.com</issuer>
+      </issuers>
+      <required-claims>
+        <claim name="sub" match="any">
+          <!-- allow any authenticated subject -->
+        </claim>
+      </required-claims>
+    </validate-jwt>
+
+    <!-- ── 2. Rate limiting — 60 req/min per subscription key ────────
+         Uses the APIM subscription key header or query param.
+    ──────────────────────────────────────────────────────────────────-->
+    <rate-limit-by-key calls="60" renewal-period="60"
+                       counter-key="@(context.Subscription.Key)"
+                       increment-condition="@(true)"
+                       retry-after-header-name="Retry-After"
+                       remaining-calls-header-name="X-RateLimit-Remaining" />
+
+    <!-- ── 3. Extract JWT claims for downstream logging ─────────────-->
+    <set-variable name="jwtSub"
+                  value="@(context.Request.Headers.GetValueOrDefault("Authorization","")
+                            .Split(' ').Last()
+                            .AsJwt()?.Claims.GetValueOrDefault("sub","anonymous") ?? "anonymous")" />
+
+    <!-- ── 4. Correlation ID ─────────────────────────────────────────-->
+    <set-variable name="correlationId"
+                  value="@(context.Request.Headers.GetValueOrDefault("X-Correlation-Id",
+                            System.Guid.NewGuid().ToString()))" />
+    <set-header name="X-Correlation-Id" exists-action="override">
+      <value>@((string)context.Variables["correlationId"])</value>
+    </set-header>
+
+    <!-- ── 5. Record inbound timestamp for latency tracking ──────────-->
+    <set-variable name="requestStartTime" value="@(DateTime.UtcNow.ToString("o"))" />
+
+    <!-- ── 6. Route to the correct backend ───────────────────────────
+         The operation-level <inbound> sections below set the backend
+         and inject the provider-specific API key.  This global section
+         only establishes shared headers that every provider requires.
+    ──────────────────────────────────────────────────────────────────-->
+    <set-header name="Content-Type" exists-action="override">
+      <value>application/json</value>
+    </set-header>
+
+    <!-- Strip the forwarded-for chain to prevent spoofing -->
+    <set-header name="X-Forwarded-For" exists-action="delete" />
+  </inbound>
+
+  <backend>
+    <forward-request timeout="120" follow-redirects="false" buffer-request-body="true" />
+  </backend>
+
+  <outbound>
+    <!-- ── 7. Remove internal headers before returning to client ─────-->
+    <set-header name="x-ms-request-id" exists-action="delete" />
+    <set-header name="x-ms-correlation-request-id" exists-action="delete" />
+
+    <!-- ── 8. Token-usage cost tracking → Azure Monitor via emit-metric
+         Expects the upstream JSON body to contain a "usage" object with
+         prompt_tokens / completion_tokens (OpenAI / Mistral convention).
+         For Anthropic and Gemini the field names differ — see notes below.
+    ──────────────────────────────────────────────────────────────────-->
+    <choose>
+      <when condition="@(context.Response.StatusCode == 200)">
+        <!-- Parse the response body (buffered) to extract token counts -->
+        <set-variable name="responseBody" value="@(context.Response.Body.As<JObject>(preserveContent: true))" />
+
+        <!-- OpenAI / Mistral: usage.prompt_tokens + usage.completion_tokens -->
+        <set-variable name="promptTokens"
+                      value="@{
+                        var body = (JObject)context.Variables["responseBody"];
+                        // OpenAI / Mistral path
+                        var usage = body?["usage"];
+                        if (usage != null) return (int)(usage["prompt_tokens"] ?? 0);
+                        // Anthropic path: usage.input_tokens
+                        usage = body?["usage"];
+                        if (usage != null) return (int)(usage["input_tokens"] ?? 0);
+                        return 0;
+                      }" />
+        <set-variable name="completionTokens"
+                      value="@{
+                        var body = (JObject)context.Variables["responseBody"];
+                        var usage = body?["usage"];
+                        if (usage != null) {
+                          // OpenAI / Mistral
+                          if (usage["completion_tokens"] != null) return (int)usage["completion_tokens"];
+                          // Anthropic
+                          if (usage["output_tokens"] != null)     return (int)usage["output_tokens"];
+                          // Gemini: candidates[0].tokenCount (approximate)
+                        }
+                        var candidates = body?["candidates"];
+                        if (candidates != null && candidates.HasValues)
+                          return (int)(candidates[0]["tokenCount"] ?? 0);
+                        return 0;
+                      }" />
+
+        <!-- Emit custom metric to Azure Monitor (Application Insights) -->
+        <emit-metric name="AIGateway.PromptTokens" value="@((double)(int)context.Variables["promptTokens"])"
+                     namespace="AIGateway">
+          <dimension name="Provider" value="@(context.Operation.Name)" />
+          <dimension name="SubscriptionKey" value="@(context.Subscription.Key)" />
+          <dimension name="Subject" value="@((string)context.Variables["jwtSub"])" />
+          <dimension name="CorrelationId" value="@((string)context.Variables["correlationId"])" />
+        </emit-metric>
+        <emit-metric name="AIGateway.CompletionTokens" value="@((double)(int)context.Variables["completionTokens"])"
+                     namespace="AIGateway">
+          <dimension name="Provider" value="@(context.Operation.Name)" />
+          <dimension name="SubscriptionKey" value="@(context.Subscription.Key)" />
+        </emit-metric>
+        <emit-metric name="AIGateway.TotalTokens"
+                     value="@((double)((int)context.Variables["promptTokens"] + (int)context.Variables["completionTokens"]))"
+                     namespace="AIGateway">
+          <dimension name="Provider" value="@(context.Operation.Name)" />
+          <dimension name="SubscriptionKey" value="@(context.Subscription.Key)" />
+        </emit-metric>
+      </when>
+    </choose>
+
+    <!-- ── 9. Add response timing header ──────────────────────────────-->
+    <set-header name="X-Response-Time-Ms" exists-action="override">
+      <value>@(((DateTime.UtcNow - DateTime.Parse((string)context.Variables["requestStartTime"])).TotalMilliseconds).ToString("F0"))</value>
+    </set-header>
+    <set-header name="X-Correlation-Id" exists-action="override">
+      <value>@((string)context.Variables["correlationId"])</value>
+    </set-header>
+  </outbound>
+
+  <on-error>
+    <set-header name="X-Correlation-Id" exists-action="override">
+      <value>@((string)context.Variables["correlationId"])</value>
+    </set-header>
+    <choose>
+      <!-- Propagate 429 with Retry-After from upstream provider -->
+      <when condition="@(context.Response.StatusCode == 429)">
+        <return-response>
+          <set-status code="429" reason="Too Many Requests" />
+          <set-header name="Content-Type" exists-action="override"><value>application/json</value></set-header>
+          <set-body>{"error":"rate_limit_exceeded","message":"AI provider rate limit reached. Retry after indicated delay.","correlation_id":"@((string)context.Variables["correlationId"])"}</set-body>
+        </return-response>
+      </when>
+      <otherwise>
+        <return-response>
+          <set-status code="@(context.Response.StatusCode)" reason="@(context.Response.StatusReason)" />
+          <set-header name="Content-Type" exists-action="override"><value>application/json</value></set-header>
+          <set-body>@{
+            return new JObject(
+              new JProperty("error", "gateway_error"),
+              new JProperty("status", context.Response.StatusCode),
+              new JProperty("message", context.Response.StatusReason),
+              new JProperty("correlation_id", (string)context.Variables["correlationId"])
+            ).ToString();
+          }</set-body>
+        </return-response>
+      </otherwise>
+    </choose>
+  </on-error>
+</policies>
+
+
+<!-- ═══════════════════════════════════════════════════════════════════
+     OPERATION-LEVEL POLICIES
+     Apply each block to its corresponding APIM operation.
+     ═══════════════════════════════════════════════════════════════════ -->
+
+<!--
+  ─── POST /api/ai/claude  ────────────────────────────────────────────
+  Backend: anthropic-backend (https://api.anthropic.com)
+  Maps to: POST /v1/messages
+-->
+<!-- <policies>
+  <inbound>
+    <base />
+    <set-backend-service backend-id="anthropic-backend" />
+    <rewrite-uri template="/v1/messages" copy-unmatched-params="false" />
+    <set-header name="x-api-key" exists-action="override">
+      <value>{{anthropic-api-key}}</value>
+    </set-header>
+    <set-header name="anthropic-version" exists-action="override">
+      <value>2023-06-01</value>
+    </set-header>
+    <set-header name="anthropic-beta" exists-action="override">
+      <value>messages-2023-12-15</value>
+    </set-header>
+    <set-header name="Authorization" exists-action="delete" />
+  </inbound>
+</policies> -->
+
+
+<!--
+  ─── POST /api/ai/openai  ────────────────────────────────────────────
+  Backend: openai-backend (https://api.openai.com)
+  Maps to: POST /v1/chat/completions
+-->
+<!-- <policies>
+  <inbound>
+    <base />
+    <set-backend-service backend-id="openai-backend" />
+    <rewrite-uri template="/v1/chat/completions" copy-unmatched-params="false" />
+    <set-header name="Authorization" exists-action="override">
+      <value>@("Bearer " + "{{openai-api-key}}")</value>
+    </set-header>
+  </inbound>
+</policies> -->
+
+
+<!--
+  ─── POST /api/ai/gemini  ────────────────────────────────────────────
+  Backend: gemini-backend (https://generativelanguage.googleapis.com)
+  Model is passed as a query param: ?model=gemini-2.0-flash
+  Maps to: POST /v1beta/models/{model}:generateContent
+-->
+<!-- <policies>
+  <inbound>
+    <base />
+    <set-backend-service backend-id="gemini-backend" />
+    <set-variable name="geminiModel"
+                  value="@(context.Request.Url.Query.GetValueOrDefault("model", "gemini-2.0-flash"))" />
+    <rewrite-uri template="@("/v1beta/models/" + (string)context.Variables["geminiModel"] + ":generateContent")"
+                 copy-unmatched-params="false" />
+    <set-query-parameter name="key" exists-action="override">
+      <value>{{gemini-api-key}}</value>
+    </set-query-parameter>
+    <set-header name="Authorization" exists-action="delete" />
+  </inbound>
+</policies> -->
+
+
+<!--
+  ─── POST /api/ai/mistral  ───────────────────────────────────────────
+  Backend: mistral-backend (https://api.mistral.ai)
+  Maps to: POST /v1/chat/completions
+-->
+<!-- <policies>
+  <inbound>
+    <base />
+    <set-backend-service backend-id="mistral-backend" />
+    <rewrite-uri template="/v1/chat/completions" copy-unmatched-params="false" />
+    <set-header name="Authorization" exists-action="override">
+      <value>@("Bearer " + "{{mistral-api-key}}")</value>
+    </set-header>
+  </inbound>
+</policies> -->
