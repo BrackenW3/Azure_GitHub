@@ -1,0 +1,88 @@
+<h2>3 Ways to Build This Platform</h2>
+<p class="subtitle">Given your $200 credits, $10–15/month ongoing budget, and everything already running — which build strategy fits?</p>
+
+<div class="options">
+  <div class="option" data-choice="a" onclick="toggleSelect(this)">
+    <div class="letter">A</div>
+    <div class="content">
+      <h3>Platform-First (Azure Backbone)</h3>
+      <p>Spend $200 credits building Azure as the central hub immediately — unified IAM, App Service for APIs, Cosmos DB, AI Search. Everything routes through Azure.</p>
+      <div class="pros-cons">
+        <div class="pros"><h4>Pros</h4><ul>
+          <li>Clean architecture from day 1</li>
+          <li>Proper RBAC across all services</li>
+          <li>One dashboard to rule them all</li>
+        </ul></div>
+        <div class="cons"><h4>Cons</h4><ul>
+          <li>Credits burn before value is proven</li>
+          <li>30-day clock pressure → bad decisions</li>
+          <li>Locks you in when credits expire</li>
+        </ul></div>
+      </div>
+      <p class="label">Monthly after credits: ~$25–35/mo</p>
+    </div>
+  </div>
+
+  <div class="option" data-choice="b" onclick="toggleSelect(this)">
+    <div class="letter">B</div>
+    <div class="content">
+      <h3>Free-Tier Runway (Cloudflare + Railway)</h3>
+      <p>Build entirely on services you're already paying for: n8n (Railway), Cloudflare Workers/R2/Vectorize, Supabase, Neo4j (Railway). Azure credits held in reserve.</p>
+      <div class="pros-cons">
+        <div class="pros"><h4>Pros</h4><ul>
+          <li>$0 additional cost right now</li>
+          <li>Everything already partially wired</li>
+          <li>No 30-day pressure</li>
+        </ul></div>
+        <div class="cons"><h4>Cons</h4><ul>
+          <li>Credits expire unused</li>
+          <li>More fragmented (4 platforms)</li>
+          <li>No unified identity layer</li>
+        </ul></div>
+      </div>
+      <p class="label">Monthly ongoing: ~$10–15/mo (current)</p>
+    </div>
+  </div>
+
+  <div class="option" data-choice="c" onclick="toggleSelect(this)">
+    <div class="letter">C</div>
+    <div class="content">
+      <h3>✦ Living Architecture (Recommended)</h3>
+      <p>Free-tier core works TODAY. Spend $200 credits on targeted AI experiments (Azure OpenAI, AI Search) to discover what actually delivers ROI. Only graduate winners to paid.</p>
+      <div style="background: rgba(99,102,241,0.08); border-left: 3px solid #6366f1; padding: 10px 14px; margin: 10px 0; border-radius: 4px;">
+        <strong style="font-size: 13px;">The key insight:</strong> Use credits as a discovery budget — run Azure AI Search alongside Cloudflare Vectorize, compare quality, kill the loser. Credits become a 30-day lab, not a commitment.
+      </div>
+      <div class="pros-cons">
+        <div class="pros"><h4>Pros</h4><ul>
+          <li>Immediate value (existing stack)</li>
+          <li>Credits fund experiments, not overhead</li>
+          <li>Natural off-ramps: drop experiments that don't win</li>
+          <li>Sub-agents can run in parallel (Azure vs GCP)</li>
+        </ul></div>
+        <div class="cons"><h4>Cons</h4><ul>
+          <li>Requires discipline to kill losers</li>
+          <li>More complex to orchestrate initially</li>
+        </ul></div>
+      </div>
+      <p class="label">Monthly ongoing: $10–15/mo + only winning experiments</p>
+    </div>
+  </div>
+</div>
+
+<div class="section" style="margin-top: 24px; padding: 16px; background: rgba(16,185,129,0.07); border-radius: 8px; border: 1px solid rgba(16,185,129,0.2);">
+  <p class="label">What $200 buys in Option C (30-day lab)</p>
+  <div style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px; margin-top: 12px;">
+    <div style="text-align:center; padding: 10px; background: rgba(255,255,255,0.05); border-radius: 6px;">
+      <div style="font-size: 22px; font-weight: 700; color: #10b981;">~30 days</div>
+      <div style="font-size: 12px; color: #888;">Azure AI Search S1 trial</div>
+    </div>
+    <div style="text-align:center; padding: 10px; background: rgba(255,255,255,0.05); border-radius: 6px;">
+      <div style="font-size: 22px; font-weight: 700; color: #10b981;">~2M</div>
+      <div style="font-size: 12px; color: #888;">Azure OpenAI tokens</div>
+    </div>
+    <div style="text-align:center; padding: 10px; background: rgba(255,255,255,0.05); border-radius: 6px;">
+      <div style="font-size: 22px; font-weight: 700; color: #10b981;">Always-free</div>
+      <div style="font-size: 12px; color: #888;">Cosmos 1000 RU/s stays free</div>
+    </div>
+  </div>
+</div>
