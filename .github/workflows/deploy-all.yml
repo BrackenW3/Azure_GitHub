@@ -1,29 +1,219 @@
-name: Deploy All Services + Azure Jobs
-
+name: Deploy All Services
 on:
   workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/deploy-all.yml'
 
 jobs:
-  # ── LiteLLM ──────────────────────────────────────────────────
-  litellm:
+  neo4j:
     runs-on: ubuntu-latest
     steps:
-      - uses: azure/login@v2
-        with:
-          creds: ${{ secrets.AZURE_CREDENTIALS }}
-
-      - name: Deploy LiteLLM Container App
+      - name: Install neo4j driver
+        run: pip install neo4j --break-system-packages -q
+      - name: Apply Neo4j schema and seed
+        env:
+          NEO4J_PASSWORD: ${{ secrets.NEO4J_PASSWORD }}
+        shell: python
         run: |
-          az containerapp create \
-            --name litellm \
-            --resource-group willbracken-free-rg \
-            --environment willbracken-env \
+          import os
+          from neo4j import GraphDatabase
+          pw = os.environ.get('NEO4J_PASSWORD','')
+          if not pw:
+              print('NEO4J_PASSWORD not set - skipping')
+              exit(0)
+          try:
+              driver = GraphDatabase.driver('bolt://neo4j-production-dafa.up.railway.app:7687', auth=('neo4j', pw))
+              statements = [
+                  'CREATE CONSTRAINT user_id IF NOT EXISTS FOR (u:User) REQUIRE u.id IS UNIQUE',
+                  'CREATE CONSTRAINT content_id IF NOT EXISTS FOR (c:Content) REQUIRE c.id IS UNIQUE',
+                  'CREATE CONSTRAINT tag_name IF NOT EXISTS FOR (t:Tag) REQUIRE t.name IS UNIQUE',
+                  'CREATE CONSTRAINT project_id IF NOT EXISTS FOR (p:Project) REQUIRE p.id IS UNIQUE',
+                  "MERGE (p:Project {id:'willbracken-main'}) SET p.name='willbracken.com', p.status='active'",
+                  "MERGE (p:Project {id:'n8n'}) SET p.name='n8n Automation', p.status='active'",
+                  "MERGE (p:Project {id:'vector-search'}) SET p.name='Vector Search', p.status='active'",
+                  "MERGE (p:Project {id:'ai-router'}) SET p.name='AI Router', p.status='in-progress'",
+              ]
+              with driver.session() as s:
+                  for stmt in statements:
+                      try:
+                          s.run(stmt)
+                          print(f'OK: {stmt[:60]}')
+                      except Exception as e:
+                          print(f'Skip: {str(e)[:60]}')
+              driver.close()
+              print('Neo4j COMPLETE')
+          except Exception as e:
+              print(f'Failed: {e}')
+
+  pdf-enrichment:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install deps
+        run: pip install httpx --break-system-packages -q
+      - name: Enrich PDF documents
+        env:
+          AZURE_KEY: ${{ secrets.AZURE_OPENAI_API_KEY }}
+          SB_URL: https://smttdhtpwkowcyatoztb.supabase.co
+          SB_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+        shell: python
+        run: |
+          import os, httpx, time, json
+          URL = os.environ['SB_URL']
+          KEY = os.environ['SB_KEY']
+          AZ = os.environ['AZURE_KEY']
+          EP = 'https://willbracken-aoai-ihe42a.openai.azure.com/'
+          H = {'apikey': KEY, 'Authorization': f'Bearer {KEY}', 'Content-Type': 'application/json'}
+          r = httpx.get(f'{URL}/rest/v1/documents', headers=H,
+              params={'select':'id,content,file_path','file_path':'like.%.pdf','enriched_at':'is.null','limit':'300'}, timeout=30)
+          docs = r.json() if r.is_success and isinstance(r.json(), list) else []
+          print(f'PDF docs: {len(docs)}')
+          enriched = 0
+          for doc in docs:
+              if not isinstance(doc, dict):
+                  continue
+              content = str(doc.get('content') or '')
+              if len(content) < 50:
+                  continue
+              try:
+                  resp = httpx.post(
+                      f'{EP}openai/deployments/gpt-4o-mini/chat/completions?api-version=2025-01-01-preview',
+                      headers={'api-key': AZ, 'Content-Type': 'application/json'},
+                      json={'messages':[
+                          {'role':'system','content':'Extract: doc_type, summary (2 sentences), key_entities list. Return JSON.'},
+                          {'role':'user','content':content[:3000]}
+                      ],'max_tokens':200,'temperature':0,'response_format':{'type':'json_object'}}, timeout=20)
+                  if resp.is_success:
+                      result = json.loads(resp.json()['choices'][0]['message']['content'])
+                      httpx.patch(f'{URL}/rest/v1/documents', headers=H,
+                          params={'id':f"eq.{doc['id']}"},
+                          json={'summary':result.get('summary',''),'doc_type':result.get('doc_type','pdf'),
+                                'entities':result.get('key_entities',[]),'enriched_at':'now()'}, timeout=10)
+                      enriched += 1
+                      time.sleep(0.08)
+              except Exception as e:
+                  pass
+          print(f'PDF enrichment COMPLETE: {enriched}')
+
+  lora-finetune:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: BrackenW3/AI_Agent_Skills
+          token: ${{ secrets.GH_TOKEN }}
+      - name: Install deps
+        run: pip install openai httpx --break-system-packages -q
+      - name: Build training data and submit fine-tune
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          AZURE_OPENAI_API_KEY: ${{ secrets.AZURE_OPENAI_API_KEY }}
+        shell: python
+        run: |
+          import os, json, urllib.request, base64, httpx, time
+
+          GH_TOKEN = os.environ['GH_TOKEN']
+          KEY = os.environ['AZURE_OPENAI_API_KEY']
+          EP = "https://willbracken-aoai-ihe42a.openai.azure.com/"
+          VER = "2025-01-01-preview"
+          headers = {"Authorization": f"Bearer {GH_TOKEN}", "Accept": "application/vnd.github+json"}
+
+          repos = ["BrackenW3/AI_Agent_Skills", "BrackenW3/VSCodespace", "BrackenW3/Cloudflare"]
+          examples = []
+
+          for repo in repos:
+              try:
+                  req = urllib.request.Request(f"https://api.github.com/repos/{repo}/git/trees/main?recursive=1", headers=headers)
+                  tree = json.loads(urllib.request.urlopen(req).read()).get("tree", [])
+                  files = [f for f in tree if f["type"] == "blob"
+                           and any(f["path"].endswith(e) for e in [".md", ".ts", ".py"])
+                           and "node_modules" not in f["path"]
+                           and f.get("size", 99999) < 8000][:12]
+                  for f in files:
+                      try:
+                          req2 = urllib.request.Request(f"https://api.github.com/repos/{repo}/contents/{f['path']}", headers=headers)
+                          d = json.loads(urllib.request.urlopen(req2).read())
+                          content = base64.b64decode(d["content"]).decode("utf-8", errors="ignore")[:800]
+                          if len(content) > 100:
+                              examples.append({"messages": [
+                                  {"role": "user", "content": f"What does {f['path']} do?"},
+                                  {"role": "assistant", "content": content}
+                              ]})
+                      except:
+                          pass
+              except Exception as e:
+                  print(f"Repo error {repo}: {e}")
+
+          try:
+              with open("CLAUDE.md", "r", errors="ignore") as cf:
+                  examples.insert(0, {"messages": [
+                      {"role": "user", "content": "What are your working rules for Will Bracken projects?"},
+                      {"role": "assistant", "content": cf.read()[:3000]}
+                  ]})
+          except:
+              pass
+
+          print(f"Training examples: {len(examples)}")
+
+          with open("/tmp/training.jsonl", "w") as f:
+              for ex in examples:
+                  f.write(json.dumps(ex) + "\n")
+
+          with open("/tmp/training.jsonl", "rb") as f:
+              r = httpx.post(f"{EP}openai/files?api-version={VER}",
+                  headers={"api-key": KEY},
+                  files={"file": ("training.jsonl", f, "application/json")},
+                  data={"purpose": "fine-tune"}, timeout=60)
+
+          if not r.is_success:
+              print(f"Upload failed: {r.text}")
+              exit(0)
+
+          file_id = r.json()["id"]
+          print(f"File uploaded: {file_id}")
+          time.sleep(20)
+
+          job = httpx.post(f"{EP}openai/fine_tuning/jobs?api-version={VER}",
+              headers={"api-key": KEY, "Content-Type": "application/json"},
+              json={"training_file": file_id, "model": "gpt-4o-mini", "suffix": "wb-assistant",
+                    "hyperparameters": {"n_epochs": 3}}, timeout=60)
+
+          if job.is_success:
+              d = job.json()
+              print(f"Fine-tuning SUBMITTED: {d['id']} | Status: {d['status']}")
+          else:
+              print(f"Fine-tuning failed: {job.text}")
+
+  container-apps:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+        continue-on-error: true
+
+      - name: Ensure Container Apps Environment exists
+        run: |
+          EXISTS=$(az containerapp env show --name willbracken-env --resource-group willbracken-free-rg --query name -o tsv 2>/dev/null || echo "")
+          if [ -z "$EXISTS" ]; then
+            az containerapp env create --name willbracken-env --resource-group willbracken-free-rg --location eastus 2>&1
+            echo "Environment created"
+          else
+            echo "Environment exists: $EXISTS"
+          fi
+        continue-on-error: true
+
+      - name: Deploy LiteLLM
+        run: |
+          az containerapp create --name litellm \
+            --resource-group willbracken-free-rg --environment willbracken-env \
             --image ghcr.io/berriai/litellm:main-latest \
-            --target-port 4000 \
-            --ingress external \
-            --min-replicas 0 \
-            --max-replicas 2 \
-            --cpu 0.5 --memory 1Gi \
+            --target-port 4000 --ingress external \
+            --min-replicas 0 --max-replicas 2 --cpu 0.5 --memory 1Gi \
             --env-vars \
               ANTHROPIC_API_KEY="${{ secrets.ANTHROPIC_API_KEY }}" \
               OPENAI_API_KEY="${{ secrets.OPENAI_API_KEY }}" \
@@ -31,424 +221,54 @@ jobs:
               AZURE_API_BASE="https://willbracken-aoai-ihe42a.openai.azure.com/" \
               AZURE_API_VERSION="2025-01-01-preview" \
               OPENROUTER_API_KEY="${{ secrets.OPENROUTER_API_KEY }}" \
-              XAI_API_KEY="${{ secrets.XAI_API_KEY }}" \
-              GEMINI_API_KEY="${{ secrets.GEMINI_API_KEY }}" \
-              MISTRAL_API_KEY="${{ secrets.MISTRAL_API_KEY }}" \
-              LITELLM_MASTER_KEY="sk-wb-litellm-master" \
-              DATABASE_URL="${{ secrets.COCKROACH_DB_ADMIN_CONNECTION }}" \
-            2>&1 || true
-          
-          URL=$(az containerapp show --name litellm --resource-group willbracken-free-rg --query properties.configuration.ingress.fqdn -o tsv 2>/dev/null)
-          echo "LiteLLM URL: https://$URL"
-          echo "LITELLM_URL=https://$URL" >> $GITHUB_ENV
+              LITELLM_MASTER_KEY="sk-wb-litellm-master" 2>&1 || true
+          az containerapp show --name litellm --resource-group willbracken-free-rg \
+            --query properties.configuration.ingress.fqdn -o tsv 2>/dev/null | xargs -I{} echo "LiteLLM: https://{}"
+        continue-on-error: true
 
-  # ── LangFuse ─────────────────────────────────────────────────
-  langfuse:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: azure/login@v2
-        with:
-          creds: ${{ secrets.AZURE_CREDENTIALS }}
-
-      - name: Deploy LangFuse Container App
+      - name: Deploy LangFuse
         run: |
-          az containerapp create \
-            --name langfuse \
-            --resource-group willbracken-free-rg \
-            --environment willbracken-env \
+          az containerapp create --name langfuse \
+            --resource-group willbracken-free-rg --environment willbracken-env \
             --image langfuse/langfuse:latest \
-            --target-port 3000 \
-            --ingress external \
-            --min-replicas 0 \
-            --max-replicas 2 \
-            --cpu 0.5 --memory 1Gi \
+            --target-port 3000 --ingress external \
+            --min-replicas 0 --max-replicas 1 --cpu 0.5 --memory 1Gi \
             --env-vars \
               DATABASE_URL="${{ secrets.COCKROACH_DB_ADMIN_CONNECTION }}" \
-              NEXTAUTH_SECRET="wb-langfuse-secret-$(date +%s)" \
+              NEXTAUTH_SECRET="wb-langfuse-2026" \
               NEXTAUTH_URL="https://langfuse.willbracken.com" \
-              SALT="wb-langfuse-salt" \
-              LANGFUSE_INIT_ORG_ID="willbracken" \
-              LANGFUSE_INIT_ORG_NAME="WillBracken" \
-              LANGFUSE_INIT_PROJECT_ID="main" \
-              LANGFUSE_INIT_PROJECT_NAME="Main" \
+              SALT="wb-salt-2026" \
               LANGFUSE_INIT_USER_EMAIL="will@willbracken.com" \
-              LANGFUSE_INIT_USER_PASSWORD="WillBracken2026!" \
-            2>&1 || true
-          
-          URL=$(az containerapp show --name langfuse --resource-group willbracken-free-rg --query properties.configuration.ingress.fqdn -o tsv 2>/dev/null)
-          echo "LangFuse URL: https://$URL"
+              LANGFUSE_INIT_USER_PASSWORD="WillBracken2026!" 2>&1 || true
+          az containerapp show --name langfuse --resource-group willbracken-free-rg \
+            --query properties.configuration.ingress.fqdn -o tsv 2>/dev/null | xargs -I{} echo "LangFuse: https://{}"
+        continue-on-error: true
 
-  # ── Metabase ──────────────────────────────────────────────────
-  metabase:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: azure/login@v2
-        with:
-          creds: ${{ secrets.AZURE_CREDENTIALS }}
-
-      - name: Deploy Metabase Container App
+      - name: Deploy Metabase
         run: |
-          az containerapp create \
-            --name metabase \
-            --resource-group willbracken-free-rg \
-            --environment willbracken-env \
+          az containerapp create --name metabase \
+            --resource-group willbracken-free-rg --environment willbracken-env \
             --image metabase/metabase:latest \
-            --target-port 3000 \
-            --ingress external \
-            --min-replicas 0 \
-            --max-replicas 1 \
-            --cpu 1.0 --memory 2Gi \
+            --target-port 3000 --ingress external \
+            --min-replicas 0 --max-replicas 1 --cpu 1.0 --memory 2Gi \
             --env-vars \
               MB_DB_TYPE="postgres" \
-              MB_DB_CONNECTION_URI="${{ secrets.COCKROACH_DB_ADMIN_CONNECTION }}" \
-              MB_SITE_URL="https://analytics.willbracken.com" \
-            2>&1 || true
-          
-          URL=$(az containerapp show --name metabase --resource-group willbracken-free-rg --query properties.configuration.ingress.fqdn -o tsv 2>/dev/null)
-          echo "Metabase URL: https://$URL"
+              MB_DB_CONNECTION_URI="${{ secrets.COCKROACH_DB_ADMIN_CONNECTION }}" 2>&1 || true
+          az containerapp show --name metabase --resource-group willbracken-free-rg \
+            --query properties.configuration.ingress.fqdn -o tsv 2>/dev/null | xargs -I{} echo "Metabase: https://{}"
+        continue-on-error: true
 
-  # ── Neo4j Schema ──────────────────────────────────────────────
-  neo4j-setup:
+  summary:
+    needs: [neo4j, pdf-enrichment, lora-finetune, container-apps]
     runs-on: ubuntu-latest
+    if: always()
     steps:
-      - name: Apply Neo4j schema
-        env:
-          NEO4J_PASSWORD: ${{ secrets.NEO4J_PASSWORD }}
+      - name: Summary
         run: |
-          pip install neo4j -q
-          python3 << 'PYEOF'
-          import os
-          from neo4j import GraphDatabase
-
-          driver = GraphDatabase.driver(
-              "bolt://neo4j-production-dafa.up.railway.app:7687",
-              auth=("neo4j", os.environ["NEO4J_PASSWORD"])
-          )
-
-          statements = [
-              "CREATE CONSTRAINT user_id IF NOT EXISTS FOR (u:User) REQUIRE u.id IS UNIQUE",
-              "CREATE CONSTRAINT content_id IF NOT EXISTS FOR (c:Content) REQUIRE c.id IS UNIQUE",
-              "CREATE CONSTRAINT tag_name IF NOT EXISTS FOR (t:Tag) REQUIRE t.name IS UNIQUE",
-              "CREATE CONSTRAINT project_id IF NOT EXISTS FOR (p:Project) REQUIRE p.id IS UNIQUE",
-              "CREATE FULLTEXT INDEX content_search IF NOT EXISTS FOR (c:Content) ON EACH [c.title, c.body]",
-              "MERGE (p:Project {id:'willbracken-main'}) SET p.name='willbracken.com Platform', p.status='active'",
-              "MERGE (p:Project {id:'n8n-automation'}) SET p.name='n8n Automation Engine', p.status='active'",
-              "MERGE (p:Project {id:'vector-search'}) SET p.name='Vector Search Pipeline', p.status='active'",
-              "MERGE (p:Project {id:'ai-router'}) SET p.name='AI Router', p.status='in-progress'",
-          ]
-
-          with driver.session() as s:
-              for stmt in statements:
-                  try:
-                      s.run(stmt)
-                      print(f"OK: {stmt[:60]}")
-                  except Exception as e:
-                      print(f"Skip: {str(e)[:80]}")
-
-          driver.close()
-          print("Neo4j setup complete")
-          PYEOF
-
-  # ── Batch Document Enrichment ─────────────────────────────────
-  batch-enrichment:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          repository: BrackenW3/AI_Agent_Skills
-          token: ${{ secrets.GH_TOKEN }}
-
-      - name: Run batch enrichment on indexed documents
-        env:
-          AZURE_OPENAI_API_KEY: ${{ secrets.AZURE_OPENAI_API_KEY }}
-          SUPABASE_URL: https://smttdhtpwkowcyatoztb.supabase.co
-          SUPABASE_API_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-        run: |
-          pip install httpx supabase openai -q
-          python3 << 'PYEOF'
-          import os, json, time, httpx
-
-          SUPABASE_URL = os.environ["SUPABASE_URL"]
-          SUPABASE_KEY = os.environ["SUPABASE_API_KEY"]
-          AZURE_KEY = os.environ["AZURE_OPENAI_API_KEY"]
-          AZURE_ENDPOINT = "https://willbracken-aoai-ihe42a.openai.azure.com/"
-
-          headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
-
-          # Get documents without summaries
-          r = httpx.get(
-              f"{SUPABASE_URL}/rest/v1/documents",
-              headers=headers,
-              params={"select": "id,content,file_path,file_source", "summary": "is.null", "limit": "500"}
-          )
-          docs = r.json() if r.is_success else []
-          print(f"Documents to enrich: {len(docs)}")
-
-          enriched = 0
-          for doc in docs:
-              content = doc.get("content", "")
-              if len(content) < 100:
-                  continue
-
-              # Summarize via Azure OpenAI batch-style
-              try:
-                  resp = httpx.post(
-                      f"{AZURE_ENDPOINT}openai/deployments/gpt-4o-mini/chat/completions?api-version=2025-01-01-preview",
-                      headers={"api-key": AZURE_KEY},
-                      json={
-                          "messages": [
-                              {"role": "system", "content": "Summarize this document chunk in 1-2 sentences. Extract: main topic, key entities, document type."},
-                              {"role": "user", "content": content[:2000]}
-                          ],
-                          "max_tokens": 150,
-                          "temperature": 0
-                      },
-                      timeout=30
-                  )
-                  if resp.is_success:
-                      summary = resp.json()["choices"][0]["message"]["content"]
-                      # Update Supabase
-                      httpx.patch(
-                          f"{SUPABASE_URL}/rest/v1/documents",
-                          headers={**headers, "Content-Type": "application/json"},
-                          params={"id": f"eq.{doc['id']}"},
-                          json={"summary": summary}
-                      )
-                      enriched += 1
-                      if enriched % 50 == 0:
-                          print(f"Enriched {enriched} documents...")
-                      time.sleep(0.1)
-              except Exception as e:
-                  print(f"Error: {e}")
-
-          print(f"Enrichment complete: {enriched} documents processed")
-          PYEOF
-
-  # ── LoRA Fine-tuning ──────────────────────────────────────────
-  lora-finetune:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: azure/login@v2
-        with:
-          creds: ${{ secrets.AZURE_CREDENTIALS }}
-
-      - uses: actions/checkout@v4
-        with:
-          repository: BrackenW3/AI_Agent_Skills
-          token: ${{ secrets.GH_TOKEN }}
-
-      - name: Prepare training data from repos
-        env:
-          GH_TOKEN: ${{ secrets.GH_TOKEN }}
-          AZURE_OPENAI_API_KEY: ${{ secrets.AZURE_OPENAI_API_KEY }}
-        run: |
-          pip install openai httpx -q
-
-          python3 << 'PYEOF'
-          import os, json, urllib.request
-
-          GH_TOKEN = os.environ["GH_TOKEN"]
-          headers = {"Authorization": f"Bearer {GH_TOKEN}", "Accept": "application/vnd.github+json"}
-
-          # Collect training data from key repos
-          repos = ["BrackenW3/AI_Agent_Skills", "BrackenW3/VSCodespace", "BrackenW3/Cloudflare"]
-          training_examples = []
-
-          for repo in repos:
-              req = urllib.request.Request(
-                  f"https://api.github.com/repos/{repo}/git/trees/main?recursive=1",
-                  headers=headers
-              )
-              try:
-                  resp = urllib.request.urlopen(req)
-                  tree = json.loads(resp.read())
-                  files = [f for f in tree.get("tree", []) if f["type"] == "blob"
-                           and any(f["path"].endswith(ext) for ext in [".md", ".ts", ".py", ".json"])
-                           and "node_modules" not in f["path"]][:20]
-
-                  for f in files:
-                      try:
-                          req2 = urllib.request.Request(
-                              f"https://api.github.com/repos/{repo}/contents/{f['path']}",
-                              headers=headers
-                          )
-                          r = urllib.request.urlopen(req2)
-                          d = json.loads(r.read())
-                          import base64
-                          content = base64.b64decode(d["content"]).decode("utf-8", errors="ignore")[:1000]
-                          if len(content) > 100:
-                              training_examples.append({
-                                  "messages": [
-                                      {"role": "user", "content": f"Explain this file from {repo}: {f['path']}"},
-                                      {"role": "assistant", "content": content}
-                                  ]
-                              })
-                      except:
-                          pass
-              except Exception as e:
-                  print(f"Error on {repo}: {e}")
-
-          # Add CLAUDE.md and PROJECTS.md as high-priority training data
-          with open("CLAUDE.md", "r", errors="ignore") as f:
-              claude_md = f.read()
-          training_examples.insert(0, {
-              "messages": [
-                  {"role": "user", "content": "What are the rules and context for working on Will Bracken's projects?"},
-                  {"role": "assistant", "content": claude_md[:3000]}
-              ]
-          })
-
-          # Write JSONL training file
-          with open("/tmp/training_data.jsonl", "w") as f:
-              for ex in training_examples:
-                  f.write(json.dumps(ex) + "\n")
-
-          print(f"Training examples prepared: {len(training_examples)}")
-          PYEOF
-
-      - name: Submit fine-tuning job to Azure
-        env:
-          AZURE_OPENAI_API_KEY: ${{ secrets.AZURE_OPENAI_API_KEY }}
-        run: |
-          python3 << 'PYEOF'
-          import os, httpx, json, time
-
-          KEY = os.environ["AZURE_OPENAI_API_KEY"]
-          ENDPOINT = "https://willbracken-aoai-ihe42a.openai.azure.com/"
-          API_VER = "2025-01-01-preview"
-
-          # Upload training file
-          with open("/tmp/training_data.jsonl", "rb") as f:
-              r = httpx.post(
-                  f"{ENDPOINT}openai/files?api-version={API_VER}",
-                  headers={"api-key": KEY},
-                  files={"file": ("training_data.jsonl", f, "application/json")},
-                  data={"purpose": "fine-tune"},
-                  timeout=60
-              )
-
-          if not r.is_success:
-              print(f"File upload failed: {r.text}")
-              exit(1)
-
-          file_id = r.json()["id"]
-          print(f"Training file uploaded: {file_id}")
-
-          # Wait for file processing
-          time.sleep(30)
-
-          # Submit fine-tuning job (Phi-4-mini or gpt-4o-mini)
-          job_r = httpx.post(
-              f"{ENDPOINT}openai/fine_tuning/jobs?api-version={API_VER}",
-              headers={"api-key": KEY, "Content-Type": "application/json"},
-              json={
-                  "training_file": file_id,
-                  "model": "gpt-4o-mini",
-                  "suffix": "willbracken-assistant",
-                  "hyperparameters": {
-                      "n_epochs": 3,
-                      "batch_size": "auto",
-                      "learning_rate_multiplier": "auto"
-                  }
-              },
-              timeout=60
-          )
-
-          if job_r.is_success:
-              job = job_r.json()
-              print(f"Fine-tuning job submitted!")
-              print(f"Job ID: {job['id']}")
-              print(f"Status: {job['status']}")
-              print(f"Model will be: gpt-4o-mini.ft-willbracken-assistant")
-          else:
-              print(f"Fine-tuning failed: {job_r.text}")
-          PYEOF
-
-  # ── PDF Content Understanding ─────────────────────────────────
-  pdf-enrichment:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Process PDFs via Azure Content Understanding
-        env:
-          AZURE_OPENAI_API_KEY: ${{ secrets.AZURE_OPENAI_API_KEY }}
-          SUPABASE_URL: https://smttdhtpwkowcyatoztb.supabase.co
-          SUPABASE_API_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
-          GH_TOKEN: ${{ secrets.GH_TOKEN }}
-        run: |
-          pip install httpx supabase pypdf2 -q
-          python3 << 'PYEOF'
-          import os, httpx, json, time
-
-          SUPABASE_URL = os.environ["SUPABASE_URL"]
-          SUPABASE_KEY = os.environ["SUPABASE_API_KEY"]
-          AZURE_KEY = os.environ["AZURE_OPENAI_API_KEY"]
-          ENDPOINT = "https://willbracken-aoai-ihe42a.openai.azure.com/"
-
-          headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
-
-          # Get PDF documents from index
-          r = httpx.get(
-              f"{SUPABASE_URL}/rest/v1/documents",
-              headers=headers,
-              params={"select": "id,content,file_path,metadata", "file_path": "like.*.pdf", "limit": "100"}
-          )
-          pdfs = r.json() if r.is_success else []
-          print(f"PDF documents found: {len(pdfs)}")
-
-          for doc in pdfs:
-              content = doc.get("content", "")
-              if not content:
-                  continue
-
-              try:
-                  resp = httpx.post(
-                      f"{ENDPOINT}openai/deployments/gpt-4o-mini/chat/completions?api-version=2025-01-01-preview",
-                      headers={"api-key": AZURE_KEY},
-                      json={
-                          "messages": [
-                              {"role": "system", "content": "Extract from this PDF content: 1) document type 2) main topics 3) key entities (people, orgs, dates) 4) one-line summary. Return as JSON."},
-                              {"role": "user", "content": content[:3000]}
-                          ],
-                          "max_tokens": 300,
-                          "temperature": 0,
-                          "response_format": {"type": "json_object"}
-                      },
-                      timeout=30
-                  )
-                  if resp.is_success:
-                      extracted = resp.json()["choices"][0]["message"]["content"]
-                      httpx.patch(
-                          f"{SUPABASE_URL}/rest/v1/documents",
-                          headers={**headers, "Content-Type": "application/json"},
-                          params={"id": f"eq.{doc['id']}"},
-                          json={"metadata": extracted}
-                      )
-                      time.sleep(0.1)
-              except Exception as e:
-                  print(f"Error: {e}")
-
-          print("PDF enrichment complete")
-          PYEOF
-
-  # ── Container App Environment Check/Create ────────────────────
-  ensure-environment:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: azure/login@v2
-        with:
-          creds: ${{ secrets.AZURE_CREDENTIALS }}
-      - name: Ensure Container Apps environment exists
-        run: |
-          EXISTS=$(az containerapp env show --name willbracken-env --resource-group willbracken-free-rg --query name -o tsv 2>/dev/null || echo "")
-          if [ -z "$EXISTS" ]; then
-            echo "Creating Container Apps environment..."
-            az containerapp env create \
-              --name willbracken-env \
-              --resource-group willbracken-free-rg \
-              --location centralus
-            echo "Environment created"
-          else
-            echo "Environment exists: $EXISTS"
-          fi
-
+          echo "=============================="
+          echo "Neo4j:          ${{ needs.neo4j.result }}"
+          echo "PDF Enrichment: ${{ needs.pdf-enrichment.result }}"
+          echo "LoRA Fine-tune: ${{ needs.lora-finetune.result }}"
+          echo "Container Apps: ${{ needs.container-apps.result }}"
+          echo "Batch Enrichment: running separately (82K docs)"
+          echo "=============================="
